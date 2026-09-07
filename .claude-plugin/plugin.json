@@ -1,0 +1,18 @@
+{
+  "name": "gdkit",
+  "displayName": "gdkit — Godot Dev Kit",
+  "description": "Godot project tools over MCP: launch and stop games, inspect process logs, check GDScript, run tests, import assets, export builds, and look up the engine API.",
+  "author": {
+    "name": "gdkit contributors"
+  },
+  "homepage": "https://github.com/Achilleees/godot-mcp-gdkit",
+  "license": "MIT",
+  "keywords": [
+    "godot",
+    "gamedev",
+    "mcp",
+    "playtesting",
+    "gdscript",
+    "claude-code"
+  ]
+}

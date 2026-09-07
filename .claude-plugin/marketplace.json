@@ -1,0 +1,13 @@
+{
+  "name": "godot-mcp-gdkit",
+  "owner": {
+    "name": "gdkit contributors"
+  },
+  "description": "Godot MCP toolkit for Claude Code.",
+  "plugins": [
+    {
+      "name": "gdkit",
+      "source": "./"
+    }
+  ]
+}

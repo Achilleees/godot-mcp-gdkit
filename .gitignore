@@ -1,0 +1,14 @@
+# Rust build output
+/target/
+/server/target/
+**/*.rs.bk
+/bin/*.exe
+/bin/*.pdb
+
+# Godot cache
+.godot/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini

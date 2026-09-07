@@ -1,0 +1,13 @@
+# Default: treat as text, normalize to LF in the repo AND the working tree.
+# Hook/shell scripts must stay LF or they fail under `sh` on Linux/macOS;
+# LF everywhere also keeps diffs clean across Windows/mac/Linux contributors.
+* text=auto eol=lf
+
+# Binaries — never normalize. The shipped MCP server binary must stay byte-exact.
+*.exe  binary
+*.pdb  binary
+*.dll  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.ico  binary

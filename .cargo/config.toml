@@ -1,0 +1,5 @@
+# Statically link the VC runtime so the shipped godot-mcp.exe is self-contained on
+# any Windows 10+ machine (UCRT is an OS component; only vcruntime140.dll needs bundling).
+# Placed at the repo root so it applies whether cargo is invoked from ./ or ./server.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

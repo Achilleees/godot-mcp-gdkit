@@ -1,0 +1,7 @@
+; Fixture with a deliberately broken script, for gdkit's check_script self-test.
+
+config_version=5
+
+[application]
+
+config/name="gdkit-fixture-bad"

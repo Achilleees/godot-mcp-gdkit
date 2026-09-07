@@ -1,0 +1,12 @@
+; Minimal Godot 4.x project used by gdkit's own self-tests. Boots, prints a marker, quits.
+
+config_version=5
+
+[application]
+
+config/name="gdkit-fixture-hello"
+run/main_scene="res://main.tscn"
+
+[debug]
+
+[rendering]
