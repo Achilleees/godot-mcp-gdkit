@@ -44,7 +44,8 @@ impl Config {
             std::env::var("GODOT_BIN").ok().as_deref(),
             &settings,
         ))
-        .or_else(discover_godot);
+        .or_else(discover_godot)
+        .and_then(|path| std::path::absolute(path).ok());
 
         let project_dir = first_project_dir(project_candidates(
             std::env::var("GODOT_PROJECT").ok().as_deref(),
@@ -56,7 +57,7 @@ impl Config {
         Self {
             godot_bin,
             project_dir,
-            data_dir,
+            data_dir: std::path::absolute(&data_dir).unwrap_or(data_dir),
             settings,
         }
     }
@@ -114,7 +115,7 @@ pub fn project_candidates(
 pub fn first_existing_file(candidates: Vec<PathBuf>) -> Option<PathBuf> {
     for c in candidates {
         if c.is_file() {
-            return Some(c);
+            return std::path::absolute(c).ok();
         }
         tracing::warn!("configured Godot binary is not a file: {}", c.display());
     }
@@ -126,6 +127,7 @@ pub fn first_project_dir(candidates: Vec<PathBuf>) -> Option<PathBuf> {
     candidates
         .into_iter()
         .find(|dir| dir.join("project.godot").is_file())
+        .and_then(|dir| std::path::absolute(dir).ok())
 }
 
 /// `PATH` (godot/godot.exe) > common install locations. Console build preferred.
@@ -268,5 +270,23 @@ mod tests {
         assert_eq!(picked, Some(real));
         assert_eq!(first_existing_file(vec![dir.join("nope.exe")]), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relative_discovery_is_anchored_before_a_child_changes_directory() {
+        let relative = PathBuf::from(format!("gdkit-relative-{}", std::process::id()));
+        let directory = std::env::current_dir().unwrap().join(&relative);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("project.godot"), "config_version=5\n").unwrap();
+        std::fs::write(directory.join("engine.exe"), "fixture").unwrap();
+        assert_eq!(
+            first_project_dir(vec![relative.clone()]),
+            Some(directory.clone())
+        );
+        assert_eq!(
+            first_existing_file(vec![relative.join("engine.exe")]),
+            Some(directory.join("engine.exe"))
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -182,9 +182,9 @@ const SUMMARY_MAX_LEN: usize = 200;
 pub fn shape(res: &OneshotResult, tail: usize) -> TestOutcome {
     let status = if res.timed_out {
         TestStatus::TimedOut
-    } else if res.exit_code != Some(0) {
+    } else if res.exit_code != Some(0) || !res.capture_complete {
         TestStatus::Failed
-    } else if res.lines.iter().any(|l| l.is_error) {
+    } else if res.error_count > 0 {
         TestStatus::PassedWithErrors
     } else {
         TestStatus::Passed
@@ -283,6 +283,8 @@ mod tests {
         OneshotResult {
             exit_code: Some(0),
             timed_out: false,
+            error_count: raw.iter().filter(|(_, error)| *error).count(),
+            capture_complete: true,
             lines: raw
                 .iter()
                 .map(|(t, e)| LogLine {
@@ -383,6 +385,24 @@ mod tests {
         let out = shape(&res, 40);
         assert_eq!(out.status, TestStatus::PassedWithErrors);
         assert!(!out.status.is_failure(), "a clean exit is not a tool error");
+    }
+
+    #[test]
+    fn an_incomplete_capture_cannot_report_passing_tests() {
+        let mut res = lines(&[("Tests run: 2, failures: 0", false)]);
+        res.capture_complete = false;
+        let outcome = shape(&res, 40);
+        assert_eq!(outcome.status, TestStatus::Failed);
+        assert!(outcome.status.is_failure());
+        assert!(!res.ok());
+    }
+
+    #[test]
+    fn an_error_evicted_from_the_tail_still_affects_the_verdict() {
+        let mut res = lines(&[("all done", false)]);
+        res.error_count = 1;
+        assert_eq!(shape(&res, 40).status, TestStatus::PassedWithErrors);
+        assert!(!res.ok());
     }
 
     #[test]

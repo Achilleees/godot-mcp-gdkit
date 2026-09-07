@@ -32,15 +32,15 @@ use crate::docs::{self, ApiIndex};
 use crate::export::{self, ExportMode};
 use crate::process::{run_oneshot, GodotProc, RunId};
 use crate::settings::{self, Settings};
+use crate::storage::ScratchDir;
 use crate::testrun::{self, PlanSource};
 
-/// Default ceilings for the one-shot tools, in seconds. Each is overridable per call; all sit
-/// under the 10-minute client timeout declared in `.mcp.json`.
+/// Default ceilings for one-shot tools, leaving room within the 10-minute client timeout.
 const CHECK_TIMEOUT: u64 = 30;
 const VERSION_TIMEOUT: u64 = 30;
 const TESTS_TIMEOUT: u64 = 300;
-const IMPORT_TIMEOUT: u64 = 600;
-const EXPORT_TIMEOUT: u64 = 600;
+const IMPORT_TIMEOUT: u64 = 540;
+const EXPORT_TIMEOUT: u64 = 540;
 const DUMP_TIMEOUT: u64 = 300;
 
 /// Live session state shared across tool calls.
@@ -50,12 +50,27 @@ pub struct Session {
     pub next_id: RunId,
 }
 
+#[derive(PartialEq, Eq)]
+struct EngineKey {
+    path: PathBuf,
+    data_dir: PathBuf,
+    modified: std::time::SystemTime,
+    len: u64,
+}
+
+struct CachedApi {
+    engine: EngineKey,
+    index: Arc<ApiIndex>,
+}
+
 #[derive(Clone)]
 pub struct GdkitServer {
     tool_router: ToolRouter<Self>,
     cfg: Arc<Mutex<Arc<Config>>>,
     session: Arc<Mutex<Session>>,
-    api: Arc<Mutex<Option<Arc<ApiIndex>>>>,
+    api: Arc<Mutex<Option<CachedApi>>>,
+    /// Editor operations share Godot's per-user cache and may write the same project files.
+    editor: Arc<Mutex<()>>,
 }
 
 // ---- tool argument schemas ---------------------------------------------------------------
@@ -120,7 +135,7 @@ struct RunTestsArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ReimportArgs {
-    /// Kill the import after this many seconds (default 600 — a first import of a large project
+    /// Kill the import after this many seconds (default 540 — a first import of a large project
     /// is slow).
     #[serde(default)]
     timeout_secs: Option<u64>,
@@ -142,7 +157,7 @@ struct ExportArgs {
     /// Only list the available presets; export nothing.
     #[serde(default)]
     list: bool,
-    /// Kill the export after this many seconds (default 600).
+    /// Kill the export after this many seconds (default 540).
     #[serde(default)]
     timeout_secs: Option<u64>,
 }
@@ -158,7 +173,7 @@ struct DocsArgs {
     refresh: bool,
 }
 
-#[derive(Deserialize, schemars::JsonSchema)]
+#[derive(Default, Deserialize, schemars::JsonSchema)]
 struct ConfigArgs {
     /// Absolute path to the Godot executable. Pass an empty string to clear it.
     #[serde(default)]
@@ -194,6 +209,7 @@ impl GdkitServer {
                 next_id: 1,
             })),
             api: Arc::new(Mutex::new(None)),
+            editor: Arc::new(Mutex::new(())),
         }
     }
 
@@ -214,14 +230,27 @@ impl GdkitServer {
 
     /// The parsed API reference, dumping it from the engine on first use (or on `refresh`).
     async fn api_index(&self, refresh: bool) -> Result<Arc<ApiIndex>, McpError> {
-        if !refresh {
-            if let Some(idx) = self.api.lock().await.clone() {
-                return Ok(idx);
-            }
-        }
-
         let cfg = self.cfg().await;
         let godot = need_godot(&cfg)?;
+        let meta = std::fs::metadata(&godot).map_err(|e| {
+            McpError::internal_error(format!("cannot inspect {}: {e}", godot.display()), None)
+        })?;
+        let engine = EngineKey {
+            path: godot.clone(),
+            data_dir: cfg.data_dir.clone(),
+            modified: meta
+                .modified()
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            len: meta.len(),
+        };
+        // Serialize the load, not just access to the final pointer: concurrent callers must
+        // share a dump. Match the resolved binary so a config change cannot serve stale docs.
+        let mut cached = self.api.lock().await;
+        if !refresh {
+            if let Some(api) = cached.as_ref().filter(|api| api.engine == engine) {
+                return Ok(api.index.clone());
+            }
+        }
 
         // Key the cache by the engine's own version string: an engine upgrade must not serve the
         // previous version's API.
@@ -233,6 +262,17 @@ impl GdkitServer {
         )
         .await
         .map_err(|e| McpError::internal_error(format!("godot --version failed: {e}"), None))?;
+        if !ver.ok() {
+            return Err(McpError::internal_error(
+                format!(
+                    "godot --version failed (exit={:?}, timed_out={}):\n{}",
+                    ver.exit_code,
+                    ver.timed_out,
+                    lines_tail(&ver, 12)
+                ),
+                None,
+            ));
+        }
         let lines: Vec<String> = ver.lines.iter().map(|l| l.text.clone()).collect();
         let version = docs::parse_version_output(&lines).ok_or_else(|| {
             McpError::internal_error(
@@ -246,8 +286,9 @@ impl GdkitServer {
 
         let dir = docs::cache_dir(&cfg.data_dir, &version);
         let path = docs::cache_path(&cfg.data_dir, &version);
-        if refresh || !path.is_file() {
-            std::fs::create_dir_all(&dir).map_err(|e| {
+        let idx = if refresh || !path.is_file() {
+            let _editor = self.editor.lock().await;
+            let scratch = ScratchDir::new(&dir).map_err(|e| {
                 McpError::internal_error(format!("cannot create {}: {e}", dir.display()), None)
             })?;
             // The dump has no output-path flag: it writes into the working directory.
@@ -258,14 +299,15 @@ impl GdkitServer {
                     "--dump-extension-api-with-docs".to_string(),
                 ],
                 Duration::from_secs(DUMP_TIMEOUT),
-                Some(&dir),
+                Some(scratch.path()),
             )
             .await
             .map_err(|e| McpError::internal_error(format!("API dump failed to run: {e}"), None))?;
-            if !path.is_file() {
+            let pending = scratch.path().join(docs::DUMP_FILE);
+            if !res.ok() || !pending.is_file() {
                 return Err(McpError::internal_error(
                     format!(
-                        "the engine wrote no {} (exit={:?}{}). Output:\n{}",
+                        "the engine produced no valid {} (exit={:?}{}). Output:\n{}",
                         docs::DUMP_FILE,
                         res.exit_code,
                         if res.timed_out { ", timed out" } else { "" },
@@ -274,16 +316,21 @@ impl GdkitServer {
                     None,
                 ));
             }
+            let idx = load_api(pending.clone()).await?;
+            std::fs::rename(pending, &path).map_err(|e| {
+                McpError::internal_error(format!("cannot save {}: {e}", path.display()), None)
+            })?;
             tracing::info!("cached Godot {version} API reference at {}", path.display());
-        }
-
-        let idx = tokio::task::spawn_blocking(move || ApiIndex::load(&path))
-            .await
-            .map_err(|e| McpError::internal_error(format!("API load panicked: {e}"), None))?
-            .map_err(|e| McpError::internal_error(e, None))?;
+            idx
+        } else {
+            load_api(path).await?
+        };
 
         let idx = Arc::new(idx);
-        *self.api.lock().await = Some(idx.clone());
+        *cached = Some(CachedApi {
+            engine,
+            index: idx.clone(),
+        });
         Ok(idx)
     }
 
@@ -358,7 +405,7 @@ impl GdkitServer {
         for id in ids {
             match sess.runs.get_mut(&id) {
                 Some(proc) => {
-                    let exit = proc.poll_exit();
+                    let exit = proc.poll_exit().await;
                     let state = if exit.is_none() { "running" } else { "exited" };
                     let errors = proc.error_count().await;
                     let logs = proc.recent_logs(tail).await;
@@ -508,7 +555,7 @@ impl GdkitServer {
     }
 
     #[tool(
-        description = "Reimport the project's assets headlessly (godot --import) and rebuild the global script-class cache. Run this after adding assets or after adding/renaming a `class_name`, otherwise the editor and a running game disagree about what exists. Writes only into the project's own .godot/ cache."
+        description = "Reimport the project's assets headlessly (godot --import) and rebuild the global script-class cache. Run this after adding assets or after adding/renaming a `class_name`. Godot updates project import metadata and caches; engine errors are reported as a failed import."
     )]
     async fn reimport(
         &self,
@@ -527,6 +574,7 @@ impl GdkitServer {
             project.display().to_string(),
             "--import".to_string(),
         ];
+        let _editor = self.editor.lock().await;
         let timeout = Duration::from_secs(a.timeout_secs.unwrap_or(IMPORT_TIMEOUT));
         let res = run_oneshot(&godot, &args, timeout, None)
             .await
@@ -535,19 +583,11 @@ impl GdkitServer {
         let cache = project.join(".godot").join("global_script_class_cache.cfg");
         let mut out = format!(
             "reimport {} (exit={:?}{})\nproject: {}\nclass cache: {}\n",
-            if res.exit_code == Some(0) && !res.timed_out {
-                "OK"
-            } else {
-                "FAILED"
-            },
+            if res.ok() { "OK" } else { "FAILED" },
             res.exit_code,
             if res.timed_out { ", timed out" } else { "" },
             project.display(),
-            if cache.is_file() {
-                "rebuilt"
-            } else {
-                "absent (project declares no class_name scripts)"
-            }
+            if cache.is_file() { "present" } else { "absent" }
         );
         let errors = res.error_lines();
         if !errors.is_empty() {
@@ -556,7 +596,7 @@ impl GdkitServer {
                 out.push_str(&format!("  {e}\n"));
             }
         }
-        Ok(if res.exit_code == Some(0) && !res.timed_out {
+        Ok(if res.ok() {
             CallToolResult::success(vec![ContentBlock::text(out)])
         } else {
             out.push_str("output tail:\n");
@@ -566,7 +606,7 @@ impl GdkitServer {
     }
 
     #[tool(
-        description = "Export the project through a preset from export_presets.cfg (release, debug, or pack). list=true just names the available presets. Verifies the artifact actually appeared — a failed Godot export can still exit zero."
+        description = "Export the project through a preset from export_presets.cfg (release, debug, or pack). list=true just names the available presets. Requires a clean engine result and a nonempty artifact created or updated by this export."
     )]
     async fn export(
         &self,
@@ -607,6 +647,10 @@ impl GdkitServer {
         )
         .map_err(|e| McpError::invalid_params(e, None))?;
 
+        let _editor = self.editor.lock().await;
+        let before = export::ArtifactStamp::read(&output).map_err(|e| {
+            McpError::internal_error(format!("cannot inspect {}: {e}", output.display()), None)
+        })?;
         // The engine refuses to export into a directory that does not exist yet.
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -621,8 +665,11 @@ impl GdkitServer {
             .map_err(|e| McpError::internal_error(format!("export failed to run: {e}"), None))?;
 
         // Trusting the exit code alone is not enough here: the artifact is the evidence.
-        let produced = output.is_file();
-        let ok = res.exit_code == Some(0) && !res.timed_out && produced;
+        let after = export::ArtifactStamp::read(&output).map_err(|e| {
+            McpError::internal_error(format!("cannot inspect {}: {e}", output.display()), None)
+        })?;
+        let (produced, artifact) = export::ArtifactStamp::verdict(before.as_ref(), after.as_ref());
+        let ok = res.ok() && produced;
         let mut out = format!(
             "export {} — preset {:?} ({}) -> {}\nexit={:?}{}, artifact {}\n",
             if ok { "OK" } else { "FAILED" },
@@ -631,7 +678,7 @@ impl GdkitServer {
             output.display(),
             res.exit_code,
             if res.timed_out { ", timed out" } else { "" },
-            if produced { "written" } else { "MISSING" }
+            artifact
         );
         let errors = res.error_lines();
         if !errors.is_empty() {
@@ -664,7 +711,10 @@ impl GdkitServer {
         &self,
         Parameters(a): Parameters<ConfigArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let cfg = self.cfg().await;
+        // Serialize the complete read/modify/save/replace operation. Cloning under the lock
+        // and reacquiring it only to replace would lose concurrent clients' changes.
+        let mut current = self.cfg.lock().await;
+        let cfg = current.clone();
         let mut settings = cfg.settings.clone();
         let mut changed = a.clear;
         if a.clear {
@@ -691,15 +741,23 @@ impl GdkitServer {
             out.push_str(&format!("saved {}\n", path.display()));
             // Re-resolve so the change applies to the very next tool call.
             let fresh = Arc::new(Config::from_settings(cfg.data_dir.clone(), settings));
-            *self.cfg.lock().await = fresh.clone();
+            *current = fresh.clone();
             fresh
         } else {
             cfg
         };
 
+        drop(current);
         out.push_str(&render_config(&cfg));
         Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
     }
+}
+
+async fn load_api(path: PathBuf) -> Result<ApiIndex, McpError> {
+    tokio::task::spawn_blocking(move || ApiIndex::load(&path))
+        .await
+        .map_err(|e| McpError::internal_error(format!("API load panicked: {e}"), None))?
+        .map_err(|e| McpError::internal_error(e, None))
 }
 
 /// Apply one optional string setting; an empty string means "clear".
@@ -811,8 +869,7 @@ impl ServerHandler for GdkitServer {
                 "gdkit — Godot dev kit MCP server. Project tooling is live: run/status/stop a \
                  Godot process with classified logs, parse-check a script, run the test suite, \
                  reimport assets, export a build, look up the installed engine's API, and \
-                 persist settings. The live bridge (screenshot, scene tree, input) lands as the \
-                 build progresses. Call `config` with no arguments to see what is resolved.",
+                 persist settings. Call `config` with no arguments to see what is resolved.",
             )
     }
 }
@@ -820,6 +877,199 @@ impl ServerHandler for GdkitServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn command_server(name: &str, windows: &str, unix: &str) -> (GdkitServer, PathBuf) {
+        let project = crate::testutil::temp_project(name, &[]);
+        let godot = crate::testutil::command_fixture(&project, windows, unix);
+        let server = GdkitServer::new(Config {
+            godot_bin: Some(godot),
+            project_dir: Some(project.clone()),
+            data_dir: project.join("data"),
+            settings: Settings::default(),
+        });
+        (server, project)
+    }
+
+    fn export_request() -> Parameters<ExportArgs> {
+        Parameters(ExportArgs {
+            preset: None,
+            output: Some("build/game.pck".into()),
+            mode: Some("pack".into()),
+            list: false,
+            timeout_secs: Some(10),
+        })
+    }
+
+    fn write_export_preset(project: &Path) {
+        std::fs::write(
+            export::presets_path(project),
+            "[preset.0]\nname=\"Test\"\nplatform=\"Windows Desktop\"\nexport_filter=\"all_resources\"\ninclude_filter=\"\"\nexclude_filter=\"\"\n[preset.0.options]\nbinary_format/architecture=\"x86_64\"\n",
+        )
+        .unwrap();
+    }
+
+    fn docs_server(name: &str, version: &str) -> (GdkitServer, PathBuf) {
+        let (server, project) = command_server(
+            name,
+            &format!("if \"%~1\"==\"--version\" (\r\necho {version}\r\nexit /b 0\r\n)\r\necho dump>>\"%~dp0dumps.txt\"\r\ncopy /y \"%~dp0api.json\" \"extension_api.json\" >nul\r\nexit /b 0"),
+            &format!("if [ \"$1\" = '--version' ]; then echo '{version}'; exit 0; fi\necho dump >> \"$(dirname \"$0\")/dumps.txt\"\ncp \"$(dirname \"$0\")/api.json\" extension_api.json\nexit 0"),
+        );
+        std::fs::write(
+            project.join("api.json"),
+            serde_json::json!({
+                "header": {"version_full_name": version},
+                "classes": [{"name": "Node", "description": version}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (server, project)
+    }
+
+    fn docs_request(refresh: bool) -> Parameters<DocsArgs> {
+        Parameters(DocsArgs {
+            query: None,
+            refresh,
+        })
+    }
+
+    #[tokio::test]
+    async fn docs_follow_a_change_of_resolved_engine() {
+        let (server, first) = docs_server("docs-first", "4.6.fixture-a");
+        let (other, second) = docs_server("docs-second", "4.7.fixture-b");
+        let initial = server.docs(docs_request(false)).await.unwrap();
+        assert!(format!("{initial:?}").contains("4.6.fixture-a"));
+        // Model the resolved configuration swap made by the config tool, independent of env.
+        *server.cfg.lock().await = other.cfg().await;
+        let changed = server.docs(docs_request(false)).await.unwrap();
+        assert!(
+            format!("{changed:?}").contains("4.7.fixture-b"),
+            "{changed:?}"
+        );
+        let _ = std::fs::remove_dir_all(first);
+        let _ = std::fs::remove_dir_all(second);
+    }
+
+    #[tokio::test]
+    async fn concurrent_docs_queries_share_one_dump() {
+        let (server, project) = docs_server("docs-concurrent", "4.7.fixture-concurrent");
+        let (first, second) = tokio::join!(
+            server.docs(docs_request(false)),
+            server.docs(docs_request(false))
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project.join("dumps.txt"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[tokio::test]
+    async fn failed_docs_refresh_preserves_cache_and_reports_failure() {
+        let version = "4.7.fixture-refresh";
+        let (server, project) = docs_server("docs-refresh", version);
+        server.docs(docs_request(false)).await.unwrap();
+        let cache = docs::cache_path(&project.join("data"), version);
+        let original = std::fs::read(&cache).unwrap();
+        crate::testutil::command_fixture(
+            &project,
+            &format!("if \"%~1\"==\"--version\" (\r\necho {version}\r\nexit /b 0\r\n)\r\necho ERROR: dump failed\r\nexit /b 0"),
+            &format!("if [ \"$1\" = '--version' ]; then echo '{version}'; exit 0; fi\necho 'ERROR: dump failed'\nexit 0"),
+        );
+        assert!(server.docs(docs_request(true)).await.is_err());
+        assert_eq!(std::fs::read(cache).unwrap(), original);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[tokio::test]
+    async fn malformed_docs_refresh_preserves_the_previous_dump() {
+        let version = "4.7.fixture-malformed";
+        let (server, project) = docs_server("docs-malformed", version);
+        server.docs(docs_request(false)).await.unwrap();
+        let cache = docs::cache_path(&project.join("data"), version);
+        let original = std::fs::read(&cache).unwrap();
+        std::fs::write(project.join("api.json"), "{incomplete").unwrap();
+        assert!(server.docs(docs_request(true)).await.is_err());
+        assert_eq!(std::fs::read(cache).unwrap(), original);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[tokio::test]
+    async fn import_errors_cannot_report_success_on_exit_zero() {
+        let (server, project) = command_server(
+            "import-errors",
+            "echo ERROR: import failed\r\nexit /b 0",
+            "echo 'ERROR: import failed'\nexit 0",
+        );
+        let result = server
+            .reimport(Parameters(ReimportArgs {
+                timeout_secs: Some(10),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[tokio::test]
+    async fn export_rejects_an_unchanged_previous_artifact() {
+        let (server, project) = command_server("export-stale", "exit /b 0", "exit 0");
+        write_export_preset(&project);
+        std::fs::create_dir_all(project.join("build")).unwrap();
+        let artifact = project.join("build/game.pck");
+        std::fs::write(&artifact, "previous build").unwrap();
+        let result = server.export(export_request()).await.unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(std::fs::read_to_string(artifact).unwrap(), "previous build");
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[tokio::test]
+    async fn export_errors_cannot_report_success_with_an_artifact() {
+        let (server, project) = command_server(
+            "export-errors",
+            "echo output>\"%~dp0build\\game.pck\"\r\necho ERROR: export failed\r\nexit /b 0",
+            "echo output > \"$(dirname \"$0\")/build/game.pck\"\necho 'ERROR: export failed'\nexit 0",
+        );
+        write_export_preset(&project);
+        let result = server.export(export_request()).await.unwrap();
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[tokio::test]
+    async fn concurrent_config_updates_preserve_both_settings() {
+        let (server, project) = command_server("config-concurrent", "exit /b 0", "exit 0");
+        let guard = server.cfg.lock().await;
+        let mut first = Box::pin(server.config(Parameters(ConfigArgs {
+            export_preset: Some("Test".into()),
+            ..Default::default()
+        })));
+        let mut second = Box::pin(server.config(Parameters(ConfigArgs {
+            export_output: Some("build/game.pck".into()),
+            ..Default::default()
+        })));
+        // Queue both calls on the same initial state before allowing either to run.
+        assert!(futures_util::poll!(&mut first).is_pending());
+        assert!(futures_util::poll!(&mut second).is_pending());
+        drop(guard);
+        let (first, second) = tokio::join!(first, second);
+        first.unwrap();
+        second.unwrap();
+        let cfg = server.cfg().await;
+        assert_eq!(cfg.settings.export_preset.as_deref(), Some("Test"));
+        assert_eq!(
+            cfg.settings.export_output.as_deref(),
+            Some("build/game.pck")
+        );
+        assert_eq!(Settings::load(&cfg.data_dir), cfg.settings);
+        let _ = std::fs::remove_dir_all(project);
+    }
 
     #[test]
     fn export_modes_parse_and_default_to_release() {
@@ -897,6 +1147,49 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[tokio::test]
+    async fn exports_a_resource_pack_with_the_real_engine() {
+        let Some((godot, _engine_guard)) =
+            crate::testutil::godot_or_skip("exports_a_resource_pack").await
+        else {
+            return;
+        };
+        let project = crate::testutil::temp_project(
+            "pack-export",
+            &[("resource.tres", "[gd_resource type=\"Resource\" format=3]\n[resource]\nresource_name=\"export fixture\"\n")],
+        );
+        write_export_preset(&project);
+        let server = GdkitServer::new(Config {
+            godot_bin: Some(godot),
+            project_dir: Some(project.clone()),
+            data_dir: project.join("data"),
+            settings: Settings::default(),
+        });
+        let result = server
+            .export(Parameters(ExportArgs {
+                timeout_secs: Some(120),
+                ..export_request().0
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        let pack = std::fs::read(project.join("build/game.pck")).unwrap();
+        assert!(pack.starts_with(b"GDPC"), "expected a Godot resource pack");
+        let repeated = server
+            .export(Parameters(ExportArgs {
+                timeout_secs: Some(120),
+                ..export_request().0
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            repeated.is_error,
+            Some(false),
+            "re-export must update the artifact: {repeated:?}"
+        );
+        let _ = std::fs::remove_dir_all(project);
     }
 
     #[test]

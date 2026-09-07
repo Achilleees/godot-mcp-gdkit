@@ -67,10 +67,12 @@ impl Settings {
 
     /// Write the settings file into `dir`, creating the directory if needed.
     pub fn save(&self, dir: &Path) -> std::io::Result<PathBuf> {
-        std::fs::create_dir_all(dir)?;
         let path = settings_path(dir);
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(&path, format!("{json}\n"))?;
+        let scratch = crate::storage::ScratchDir::new(dir)?;
+        let pending = scratch.path().join(SETTINGS_FILE);
+        std::fs::write(&pending, format!("{json}\n"))?;
+        std::fs::rename(pending, &path)?;
         Ok(path)
     }
 

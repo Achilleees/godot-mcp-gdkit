@@ -402,6 +402,118 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    async fn rpc(app: Router, session: Option<&str>, body: serde_json::Value) -> Response {
+        let mut request = Request::post("/mcp")
+            .header("host", "localhost")
+            .header(AUTHORIZATION, "Bearer secret")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-03-26");
+        if let Some(id) = session {
+            request = request.header("mcp-session-id", id);
+        }
+        app.oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn rpc_body(response: Response) -> serde_json::Value {
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            to_bytes(response.into_body(), 128 * 1024),
+        )
+        .await
+        .expect("RPC response must finish")
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let json = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .find(|data| !data.trim().is_empty())
+            .unwrap_or(&body);
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn authenticated_http_round_trip() {
+        use serde_json::json;
+        let app = test_router();
+        let response = rpc(
+            app.clone(),
+            None,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                    "clientInfo": {"name": "gdkit-test", "version": "1"}}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let session = response
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let initialized = rpc_body(response).await;
+        assert_eq!(initialized["result"]["serverInfo"]["name"], "godot-mcp");
+        let response = rpc(
+            app.clone(),
+            Some(&session),
+            json!({
+                "jsonrpc": "2.0", "method": "notifications/initialized"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let response = rpc(
+            app.clone(),
+            Some(&session),
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = rpc_body(response).await;
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 10);
+        let response = rpc(
+            app.clone(),
+            Some(&session),
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "ping", "arguments": {"message": "http-smoke"}}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let ping = rpc_body(response).await;
+        assert_eq!(ping["result"]["content"][0]["text"], "pong: http-smoke");
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::delete("/mcp")
+                    .header("host", "localhost")
+                    .header(AUTHORIZATION, "Bearer secret")
+                    .header("mcp-session-id", &session)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::ACCEPTED);
+        let expired = rpc(
+            app,
+            Some(&session),
+            json!({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/list", "params": {}
+            }),
+        )
+        .await;
+        assert_eq!(expired.status(), StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn ct_eq_matches_exactly() {
         assert!(ct_eq(b"abc", b"abc"));

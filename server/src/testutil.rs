@@ -54,3 +54,24 @@ pub fn temp_project(name: &str, files: &[(&str, &str)]) -> PathBuf {
     }
     dir
 }
+
+/// A tiny command fixture for testing engine failure modes without relying on engine bugs.
+pub fn command_fixture(dir: &std::path::Path, windows: &str, unix: &str) -> PathBuf {
+    #[cfg(windows)]
+    let path = {
+        let _ = unix;
+        let path = dir.join("engine.cmd");
+        std::fs::write(&path, format!("@echo off\r\n{windows}\r\n")).unwrap();
+        path
+    };
+    #[cfg(not(windows))]
+    let path = {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = windows;
+        let path = dir.join("engine.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{unix}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    };
+    path
+}

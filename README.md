@@ -53,15 +53,25 @@ and stderr for diagnostic logs.
 `run_tests` detects gdUnit4, GUT, and supported script harnesses by their runner files.
 An explicit command takes precedence over a saved command, which takes precedence over
 detection. Commands accept `{godot}` and `{project}` placeholders.
+Timeouts cover the command and its output streams. Windows commands run in owned
+process jobs, so timeout, cancellation, and shutdown also terminate their descendants.
+Captured logs retain up to 4,000 lines and 4 MiB, with cumulative error counts.
+Lines over 64 KiB are truncated;
+incomplete capture cannot produce a passing verdict. A test command that exits zero
+with engine errors is reported as `PASSED (with engine errors)`.
+
+`reimport` reports failure when Godot prints engine errors, even if it exits zero.
 
 `export` reads `export_presets.cfg`. Specify a preset when the project has more than
 one, or save a default with `config`. Godot export templates are required for the
-chosen platform. An export succeeds only when the engine exits successfully without
-reported errors and the output file exists.
+chosen platform for executable builds. An export succeeds only when the engine exits
+successfully without reported errors and the output is a nonempty file whose metadata
+shows it was created or updated. An unchanged previous build cannot satisfy this check.
 
 `docs` generates its reference from the installed engine and caches it by engine
 version. Queries can name a class (`Sprite2D`), a member (`Node.queue_free`), or a
-substring. Pass `refresh: true` to rebuild the cached reference.
+substring. Pass `refresh: true` to rebuild the cached reference. Engine changes reload
+the index; failed refreshes preserve the previous valid cache and report an error.
 
 The current tool set does not provide screenshots, live scene-tree inspection, or
 input injection.

@@ -15,9 +15,12 @@ mod http;
 mod process;
 mod server;
 mod settings;
+mod storage;
 mod testrun;
 #[cfg(test)]
 mod testutil;
+#[cfg(windows)]
+mod windows_job;
 
 use config::Config;
 use http::Transport;

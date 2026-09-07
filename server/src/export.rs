@@ -10,6 +10,39 @@
 //! zero — so the caller verifies the artifact appeared instead of trusting the exit code alone.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+/// Snapshot the artifact before exporting so an older build cannot satisfy verification.
+#[derive(PartialEq, Eq)]
+pub struct ArtifactStamp {
+    len: u64,
+    modified: SystemTime,
+    created: Option<SystemTime>,
+}
+
+impl ArtifactStamp {
+    pub fn read(path: &Path) -> std::io::Result<Option<Self>> {
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() => Ok(Some(Self {
+                len: meta.len(),
+                modified: meta.modified()?,
+                created: meta.created().ok(),
+            })),
+            Ok(_) => Err(std::io::Error::other("export output is not a regular file")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn verdict(before: Option<&Self>, after: Option<&Self>) -> (bool, &'static str) {
+        match after {
+            None => (false, "MISSING"),
+            Some(stamp) if stamp.len == 0 => (false, "EMPTY"),
+            Some(stamp) if before == Some(stamp) => (false, "UNCHANGED from before this export"),
+            Some(_) => (true, "created or updated"),
+        }
+    }
+}
 
 /// One entry from `export_presets.cfg`.
 #[derive(Clone, Debug, PartialEq)]
